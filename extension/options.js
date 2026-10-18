@@ -1,14 +1,19 @@
 const tokenInput = document.getElementById("token");
 const status = document.getElementById("status");
-const tbody = document.getElementById("sessions");
 
 chrome.storage.local.get("token").then(({ token }) => {
   tokenInput.value = token ?? "";
   refresh();
 });
 
+// Tokens are 32 random bytes in base64url (43 chars). Pulling one out of the paste
+// tolerates extra terminal output pasted along with it.
+const extractToken = (text) => text.match(/[A-Za-z0-9_-]{43}/g)?.at(-1) ?? text.trim();
+
 document.getElementById("save").addEventListener("click", async () => {
-  await chrome.storage.local.set({ token: tokenInput.value.trim() });
+  const token = extractToken(tokenInput.value);
+  tokenInput.value = token;
+  await chrome.storage.local.set({ token });
   status.textContent = "Saved";
   setTimeout(() => (status.textContent = ""), 2000);
   refresh();
@@ -16,24 +21,25 @@ document.getElementById("save").addEventListener("click", async () => {
 
 document.getElementById("refresh").addEventListener("click", refresh);
 
-async function refresh() {
-  const sessions = await chrome.runtime.sendMessage({ type: "list-sessions" });
-  tbody.replaceChildren();
-  if (!sessions?.length) {
-    addRow(["—", "No sessions found on ports 8790–8799", ""]);
-    return;
-  }
-  for (const s of sessions) {
-    addRow(s.unauthorized ? [s.port, "Token rejected: check the pairing token", ""] : [s.port, s.repo ?? "(any repo)", s.cwd]);
-  }
-}
+const serviceText = {
+  ok: "Running",
+  "no-service": "Not running (or not reachable on 127.0.0.1:8790)",
+  "bad-token": "Running, but it rejected the token above",
+  "no-token": "Paste the token above first",
+};
 
-function addRow(cells) {
-  const tr = document.createElement("tr");
-  for (const c of cells) {
+async function refresh() {
+  const status = tokenInput.value.trim()
+    ? await chrome.runtime.sendMessage({ type: "service-status" })
+    : { state: "no-token" };
+  document.getElementById("service").textContent = serviceText[status?.state] ?? status?.state ?? "";
+  const tbody = document.getElementById("repos");
+  tbody.replaceChildren();
+  for (const repo of status?.repos ?? []) {
+    const tr = document.createElement("tr");
     const td = document.createElement("td");
-    td.textContent = String(c);
+    td.textContent = repo;
     tr.append(td);
+    tbody.append(tr);
   }
-  tbody.append(tr);
 }

@@ -1,45 +1,30 @@
-// Talks to github-channel servers on 127.0.0.1. No chrome.* APIs here, so it can
-// be tested with Bun against a real server.
+// Talks to the github-channel service on 127.0.0.1. No chrome.* APIs here, so it
+// can be tested with Bun against a real server.
 
-export const PORTS = Array.from({ length: 10 }, (_, i) => 8790 + i);
+export const DEFAULT_PORT = 8790;
 
 const base = (port) => `http://127.0.0.1:${port}`;
 const authHeaders = (token) => ({ authorization: `Bearer ${token}` });
 
-/** Returns the server's /info, or null if nothing (or something else) answers. */
-export async function probe(port, token, timeoutMs = 800) {
-  try {
-    const res = await fetch(`${base(port)}/info`, {
-      headers: authHeaders(token),
-      signal: AbortSignal.timeout(timeoutMs),
-    });
-    if (res.status === 401) return { port, unauthorized: true };
-    if (!res.ok) return null;
-    const info = await res.json();
-    return info?.name === "github-channel" ? { ...info, port } : null;
-  } catch {
-    return null;
-  }
-}
-
-export async function listSessions(token, ports = PORTS) {
-  const results = await Promise.all(ports.map((p) => probe(p, token)));
-  return results.filter(Boolean);
-}
-
 /**
- * Finds the session for a repo. A session whose repo matches wins; a session
- * with no detected repo (repo: null) accepts anything and is the fallback.
+ * Checks the service and whether it has a clone of `repo`. Returns
+ * { state: "ok" | "no-service" | "bad-token" | "no-clone", ...info }.
  */
-export async function findSession(repo, token, ports = PORTS) {
-  const sessions = await listSessions(token, ports);
-  const wanted = repo.toLowerCase();
-  const usable = sessions.filter((s) => !s.unauthorized);
-  return (
-    usable.find((s) => s.repo === wanted) ??
-    usable.find((s) => s.repo == null) ??
-    (sessions.some((s) => s.unauthorized) ? { unauthorized: true } : null)
-  );
+export async function getStatus(token, repo, port = DEFAULT_PORT) {
+  try {
+    const query = repo ? `?repo=${encodeURIComponent(repo)}` : "";
+    const res = await fetch(`${base(port)}/info${query}`, {
+      headers: authHeaders(token),
+      signal: AbortSignal.timeout(2000),
+    });
+    if (res.status === 401) return { state: "bad-token", port };
+    if (!res.ok) return { state: "no-service", port };
+    const info = await res.json();
+    if (info?.name !== "github-channel") return { state: "no-service", port };
+    return { ...info, port, state: repo && !info.clone ? "no-clone" : "ok" };
+  } catch {
+    return { state: "no-service", port };
+  }
 }
 
 export async function ask(port, token, payload) {
@@ -54,10 +39,11 @@ export async function ask(port, token, payload) {
 }
 
 /**
- * Streams reply events for a chat until the connection ends or `signal` aborts.
- * Calls onEvent({ id, chat_id, text, in_reply_to }) for each reply.
+ * Streams a chat's events until the connection ends or `signal` aborts.
+ * Calls onEvent({ id, type, chat_id, message_id, text }) where type is
+ * "status" | "partial" | "reply" | "error".
  */
-export async function streamReplies({ port, token, chatId, lastEventId = 0, signal, onEvent }) {
+export async function streamEvents({ port, token, chatId, lastEventId = 0, signal, onEvent }) {
   const res = await fetch(`${base(port)}/events?chat_id=${encodeURIComponent(chatId)}`, {
     headers: { ...authHeaders(token), "last-event-id": String(lastEventId) },
     signal,
@@ -74,7 +60,7 @@ export async function streamReplies({ port, token, chatId, lastEventId = 0, sign
       const block = buffer.slice(0, sep);
       buffer = buffer.slice(sep + 2);
       const event = parseSseBlock(block);
-      if (event?.type === "reply") onEvent(JSON.parse(event.data));
+      if (event) onEvent(JSON.parse(event.data));
     }
   }
 }

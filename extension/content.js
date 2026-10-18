@@ -22,106 +22,129 @@
   }
 
   // ---------- Diff context extraction ----------
+  // Two layouts are supported:
+  // - Classic (/files): td.blob-num[data-line-number] number cells (id ends in L<n>/R<n>),
+  //   td.blob-code code cells, file path in data-tagsearch-path / data-path.
+  // - New React view (/changes): td.diff-text-cell code cells that carry data-line-number and
+  //   data-diff-side themselves, marker in .diff-text-marker, and table[aria-label="Diff for: <path>"].
 
   const PATH_ATTRS = ["data-tagsearch-path", "data-path", "data-file-path"];
+  const PATH_SELECTOR = PATH_ATTRS.map((a) => `[${a}]`).join(",");
+  const TABLE_LABEL = "Diff for: ";
+
+  const pathAttr = (el) => PATH_ATTRS.map((a) => el.getAttribute(a)).find(Boolean) ?? null;
 
   /** File path for a node inside a diff, or null if it isn't in one. */
   function findPath(node) {
-    let el = node instanceof Element ? node : node?.parentElement;
+    const el = node instanceof Element ? node : node?.parentElement;
     if (!el) return null;
-    const selector = PATH_ATTRS.map((a) => `[${a}]`).join(",");
-    const holder = el.closest(selector);
-    if (holder) return PATH_ATTRS.map((a) => holder.getAttribute(a)).find(Boolean);
-    // Otherwise look for a file container whose subtree holds exactly one path.
+    const label = el.closest(`table[aria-label^="${TABLE_LABEL}"]`)?.getAttribute("aria-label");
+    if (label) return label.slice(TABLE_LABEL.length);
+    const holder = el.closest(PATH_SELECTOR);
+    if (holder) return pathAttr(holder);
+    // Otherwise find the nearest container whose path elements all name one file.
     for (let up = el.parentElement, depth = 0; up && depth < 12; up = up.parentElement, depth++) {
-      const found = up.querySelectorAll(selector);
-      if (found.length === 1) return PATH_ATTRS.map((a) => found[0].getAttribute(a)).find(Boolean);
-      if (found.length > 1) return null;
+      const paths = new Set([...up.querySelectorAll(PATH_SELECTOR)].map(pathAttr).filter(Boolean));
+      if (paths.size === 1) return [...paths][0];
+      if (paths.size > 1) return null;
     }
     return null;
   }
 
-  const isNumberCell = (td) => td?.hasAttribute?.("data-line-number") && td.getAttribute("data-line-number") !== "";
+  const isCodeCell = (td) => td?.tagName === "TD" && /\b(diff-text-cell|blob-code)\b/.test(td.className);
+  const hasLineNumber = (td) => !!td.getAttribute?.("data-line-number");
 
-  function sideOf(numberCell) {
-    const id = numberCell.id ?? "";
-    if (/L\d+$/.test(id)) return "LEFT";
-    if (/R\d+$/.test(id)) return "RIGHT";
-    return /deletion/.test(numberCell.className) ? "LEFT" : "RIGHT";
-  }
-
-  /** The line-number cell that a hovered cell belongs to (handles unified and split rows). */
-  function numberCellFor(cell) {
-    if (isNumberCell(cell)) return cell;
-    const row = cell.closest("tr");
-    if (!row) return null;
-    let last = null;
-    for (const td of row.cells) {
-      if (td === cell) break;
-      if (isNumberCell(td)) last = td;
+  /** { code, line, side } for a code cell, or null if it has no line (an empty split-view half). */
+  function cellLine(code) {
+    let num = hasLineNumber(code) ? code : null;
+    for (let td = code.previousElementSibling; !num && td && !isCodeCell(td); td = td.previousElementSibling) {
+      if (hasLineNumber(td)) num = td;
     }
-    return last ?? [...row.cells].find(isNumberCell) ?? null;
-  }
-
-  /** The code cell for a number cell: the next cell that isn't a number cell. */
-  function codeCellFor(numberCell) {
-    for (let td = numberCell.nextElementSibling; td; td = td.nextElementSibling) {
-      if (!td.hasAttribute("data-line-number") && !/blob-num/.test(td.className)) return td;
-    }
-    return null;
-  }
-
-  function lineText(row, side) {
-    const cells = [...row.cells].filter(isNumberCell);
-    const num = cells.find((c) => sideOf(c) === side) ?? cells.at(-1);
     if (!num) return null;
-    const code = codeCellFor(num);
-    if (!code) return null;
-    const marker =
-      code.querySelector("[data-code-marker]")?.getAttribute("data-code-marker") ??
-      (/addition/.test(code.className) ? "+" : /deletion/.test(code.className) ? "-" : " ");
-    const text = (code.querySelector(".blob-code-inner") ?? code).textContent.replace(/\n$/, "");
-    return `${marker || " "}${num.getAttribute("data-line-number").padStart(5)} | ${text}`;
+    const sideAttr = (code.getAttribute("data-diff-side") ?? num.getAttribute("data-diff-side") ?? "").toUpperCase();
+    const side =
+      sideAttr === "LEFT" || sideAttr === "RIGHT"
+        ? sideAttr
+        : /L\d+$/.test(num.id)
+          ? "LEFT"
+          : /R\d+$/.test(num.id)
+            ? "RIGHT"
+            : /deletion/.test(num.className + code.className)
+              ? "LEFT"
+              : "RIGHT";
+    return { code, line: Number(num.getAttribute("data-line-number")), side };
   }
 
-  /** Surrounding lines from the same table, numbered on the given side. */
-  function hunkAround(rowStart, rowEnd, side) {
-    const rows = [...(rowStart.closest("tbody, table")?.rows ?? [])];
+  /** The diff line under a hovered cell: its own code cell, or the code cell it numbers. */
+  function lineAt(td) {
+    const row = td?.closest("tr");
+    if (!row) return null;
+    if (isCodeCell(td)) return cellLine(td);
+    for (let n = td.nextElementSibling; n; n = n.nextElementSibling) if (isCodeCell(n)) return cellLine(n);
+    const codes = [...row.cells].filter(isCodeCell);
+    return codes.length ? cellLine(codes.at(-1)) : null;
+  }
+
+  function markerOf(code) {
+    const explicit = (
+      code.querySelector("[data-code-marker]")?.getAttribute("data-code-marker") ??
+      code.querySelector(".diff-text-marker")?.textContent ??
+      ""
+    ).trim();
+    if (explicit) return explicit;
+    const classes = code.className + " " + (code.querySelector("code")?.className ?? "");
+    return /addition/.test(classes) ? "+" : /deletion/.test(classes) ? "-" : " ";
+  }
+
+  function formatLine({ code, line }) {
+    const text = (code.querySelector(".blob-code-inner, .diff-text-inner") ?? code).textContent.replace(/\n$/, "");
+    return `${markerOf(code)}${String(line).padStart(5)} | ${text}`;
+  }
+
+  /**
+   * A row as unified-diff lines. Split-view rows hold two halves: keep the old side
+   * only when it was deleted, so context lines aren't listed twice.
+   */
+  function rowLines(row) {
+    const halves = [...row.cells].filter(isCodeCell).map(cellLine).filter(Boolean);
+    if (halves.length < 2) return halves.map(formatLine);
+    const left = halves.find((h) => h.side === "LEFT");
+    const right = halves.find((h) => h.side === "RIGHT");
+    return [left && markerOf(left.code) === "-" ? left : null, right ?? left].filter(Boolean).map(formatLine);
+  }
+
+  /** Surrounding lines from the same file's table. */
+  function hunkAround(rowStart, rowEnd) {
+    const rows = [...(rowStart.closest("table")?.rows ?? [])];
     const a = rows.indexOf(rowStart);
     const b = rows.indexOf(rowEnd);
     if (a === -1 || b === -1) return undefined;
     return rows
-      .slice(Math.max(0, a - HUNK_BEFORE), b + HUNK_AFTER + 1)
-      .map((r) => lineText(r, side))
-      .filter(Boolean)
+      .slice(Math.max(0, Math.min(a, b) - HUNK_BEFORE), Math.max(a, b) + HUNK_AFTER + 1)
+      .flatMap(rowLines)
       .join("\n");
   }
 
-  function contextForCell(cell) {
-    const num = numberCellFor(cell);
-    if (!num) return null;
-    const path = findPath(num);
+  function contextForCell(td) {
+    const info = lineAt(td);
+    if (!info) return null;
+    const path = findPath(info.code);
     if (!path) return null;
-    const line = Number(num.getAttribute("data-line-number"));
-    const side = sideOf(num);
-    const row = num.closest("tr");
-    return { path, line_start: line, line_end: line, side, hunk: hunkAround(row, row, side) };
+    const row = info.code.closest("tr");
+    return { path, line_start: info.line, line_end: info.line, side: info.side, hunk: hunkAround(row, row) };
   }
 
   function contextForSelection(selection) {
     const range = selection.getRangeAt(0);
     const path = findPath(range.startContainer);
     if (!path || path !== findPath(range.endContainer)) return null;
-    const startCell = range.startContainer.parentElement?.closest("td");
-    const endCell = range.endContainer.parentElement?.closest("td");
-    const startNum = startCell && numberCellFor(startCell);
-    const endNum = endCell && numberCellFor(endCell);
+    const start = lineAt(range.startContainer.parentElement?.closest("td"));
+    const end = lineAt(range.endContainer.parentElement?.closest("td"));
     const ctx = { path, hunk: selection.toString().slice(0, 20_000) };
-    if (startNum && endNum) {
-      const lines = [Number(startNum.getAttribute("data-line-number")), Number(endNum.getAttribute("data-line-number"))];
-      ctx.line_start = Math.min(...lines);
-      ctx.line_end = Math.max(...lines);
-      ctx.side = sideOf(endNum);
+    if (start && end) {
+      ctx.line_start = Math.min(start.line, end.line);
+      ctx.line_end = Math.max(start.line, end.line);
+      ctx.side = end.side;
     }
     return ctx;
   }
@@ -236,6 +259,9 @@
       .msg.claude { align-self: flex-start; background: var(--bg2); border: 1px solid var(--border); }
       .msg.error { align-self: center; color: #cf222e; font-size: 12px; }
       .msg.pending { align-self: flex-start; color: var(--muted); font-style: italic; font-size: 13px; }
+      .msg.streaming { opacity: .85; }
+      .msg .status { display: block; margin-top: 4px; font: 11px ui-monospace, SFMono-Regular, Menlo, monospace; font-style: normal;
+        color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
       .ctx { display: block; font: 11px ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--muted); margin-bottom: 4px; }
       .msg.claude p, .msg.claude ul, .msg.claude ol, .msg.claude pre, .msg.claude h4 { margin: 0 0 8px; } .msg.claude > :last-child { margin-bottom: 0; }
       .msg.claude ul, .msg.claude ol { padding-left: 20px; }
@@ -263,7 +289,7 @@
       <section class="panel" role="dialog" aria-label="Ask Claude">
         <header>
           <span class="dot"></span><span class="title"></span>
-          <button class="icon clear" title="Clear this chat">Clear</button>
+          <button class="icon clear" title="Clear this chat and start a new conversation">Clear</button>
           <button class="icon close" title="Close" aria-label="Close">✕</button>
         </header>
         <div class="banner"></div>
@@ -286,20 +312,59 @@
   };
 
   // ---------- Chat state ----------
+  // The extension owns the chat history: each question is sent with the recent
+  // turns, so the service stays stateless. Clear starts the conversation over.
+
+  const HISTORY_TURNS = 20;
+  const HISTORY_TURN_CHARS = 6_000;
 
   let pr = null; // { repo, pr, chatId }
-  let chat = { messages: [], instance: null, lastEventId: 0 };
+  // Persisted per PR. `waiting` holds message ids of questions still being answered.
+  let chat = emptyChat();
+  // In memory: progress of waiting questions, keyed by message id (or a local id until acknowledged).
+  const progress = new Map(); // id -> { status, partial }
   let pendingContext = null;
-  let pending = 0; // questions waiting for an answer
   let port = null;
   let askSeq = 0;
   const askCallbacks = new Map();
 
+  function emptyChat() {
+    return { messages: [], waiting: [], instance: null, lastEventId: 0 };
+  }
+
+  /**
+   * False once the extension is reloaded or updated: this script keeps running in
+   * already-open tabs, but every chrome.* call throws "Extension context invalidated".
+   */
+  const alive = () => {
+    try {
+      return !!chrome.runtime?.id;
+    } catch {
+      return false;
+    }
+  };
+
   const storageKey = () => `chat:${pr.chatId}`;
-  const save = () => chrome.storage.local.set({ [storageKey()]: { ...chat, messages: chat.messages.slice(-MAX_HISTORY) } });
+  const save = () => {
+    if (!alive()) return shutdown();
+    try {
+      chrome.storage.local.set({ [storageKey()]: { ...chat, messages: chat.messages.slice(-MAX_HISTORY) } }).catch(shutdown);
+    } catch {
+      shutdown();
+    }
+  };
 
   async function loadChat() {
-    chat = (await chrome.storage.local.get(storageKey()))[storageKey()] ?? { messages: [], instance: null, lastEventId: 0 };
+    if (!alive()) return shutdown();
+    let stored;
+    try {
+      stored = (await chrome.storage.local.get(storageKey()))[storageKey()];
+    } catch {
+      return shutdown();
+    }
+    chat = { ...emptyChat(), ...stored };
+    progress.clear();
+    for (const id of chat.waiting) progress.set(id, { status: "", partial: "" });
     renderMessages();
   }
 
@@ -309,9 +374,32 @@
     renderMessages();
   }
 
+  function clearChat() {
+    chat = { ...emptyChat(), instance: chat.instance, lastEventId: chat.lastEventId };
+    progress.clear();
+    early.clear();
+    save();
+    renderMessages();
+  }
+
+  /** Earlier turns to send with a question, oldest first. */
+  function historyForAsk() {
+    return chat.messages
+      .filter((m) => m.role === "user" || m.role === "claude")
+      .slice(-HISTORY_TURNS)
+      .map((m) => ({
+        role: m.role === "user" ? "user" : "assistant",
+        text: (m.context ? `(about ${describeContext(m.context)})\n` : "") + m.text.slice(0, HISTORY_TURN_CHARS),
+      }));
+  }
+
+  function renderClaude(el, text) {
+    el.innerHTML = renderMarkdown(text);
+  }
+
   function renderMessages() {
     ui.messages.replaceChildren();
-    if (!chat.messages.length) {
+    if (!chat.messages.length && !progress.size) {
       const empty = document.createElement("div");
       empty.className = "empty";
       empty.textContent = "Ask about the PR, or hover a diff line and click ✦ (or select code) to ask about it.";
@@ -321,11 +409,11 @@
       const el = document.createElement("div");
       el.className = `msg ${m.role}`;
       if (m.role === "claude") {
+        renderClaude(el, m.text);
         const copy = document.createElement("button");
         copy.className = "icon copy";
         copy.textContent = "Copy";
         copy.addEventListener("click", () => navigator.clipboard.writeText(m.text).then(() => (copy.textContent = "Copied")));
-        el.innerHTML = renderMarkdown(m.text);
         el.prepend(copy);
       } else {
         if (m.context) {
@@ -338,10 +426,21 @@
       }
       ui.messages.append(el);
     }
-    if (pending > 0) {
+    for (const p of progress.values()) {
       const el = document.createElement("div");
-      el.className = "msg pending";
-      el.textContent = "Claude is thinking…";
+      if (p.partial) {
+        el.className = "msg claude streaming";
+        renderClaude(el, p.partial);
+      } else {
+        el.className = "msg pending";
+        el.textContent = "Claude is thinking…";
+      }
+      if (p.status) {
+        const status = document.createElement("span");
+        status.className = "status";
+        status.textContent = p.status;
+        el.append(status);
+      }
       ui.messages.append(el);
     }
     ui.messages.scrollTop = ui.messages.scrollHeight;
@@ -351,13 +450,22 @@
 
   function setStatus(msg) {
     const states = {
-      connected: ["ok", null],
+      ok: ["ok", null],
       reconnecting: ["", null],
       "no-token": ["bad", { text: "Set the pairing token in the extension settings.", button: "Open settings", action: "options" }],
-      "bad-token": ["bad", { text: "The session rejected the pairing token. Paste the current one from `bun run token`.", button: "Open settings", action: "options" }],
-      "no-session": ["bad", {
-        text: `No Claude session found for ${pr.repo}. Start one in your clone:`,
-        code: "claude --dangerously-load-development-channels server:github-channel",
+      "bad-token": ["bad", {
+        text: "The service rejected the pairing token. Copy the current one with:",
+        code: "pbcopy < ~/.config/github-channel/token",
+        button: "Open settings", action: "options",
+      }],
+      "no-service": ["bad", {
+        text: "The Ask Claude service isn't running. Start it in github-channel/server:",
+        code: "bun start",
+        button: "Retry", action: "retry",
+      }],
+      "no-clone": ["bad", {
+        text: `No local clone of ${pr.repo} was found under ~/projects. Clone it there, or map it in ~/.config/github-channel/repos.json:`,
+        code: `{ "${pr.repo}": "/path/to/clone" }`,
         button: "Retry", action: "retry",
       }],
     };
@@ -375,26 +483,61 @@
       const btn = document.createElement("button");
       btn.textContent = banner.button;
       btn.addEventListener("click", () =>
-        banner.action === "options" ? chrome.runtime.sendMessage({ type: "open-options" }) : port?.postMessage({ type: "retry" }),
+        banner.action === "options"
+          ? alive() && chrome.runtime.sendMessage({ type: "open-options" }).catch(() => {})
+          : port?.postMessage({ type: "retry" }),
       );
       ui.banner.append(document.createElement("br"), btn);
     }
-    if (msg.state === "connected" && msg.instance !== chat.instance) {
+    if (msg.instance && msg.instance !== chat.instance) {
+      // The service restarted: event ids start over, and answers in progress were lost.
+      const lost = chat.waiting.length > 0 && chat.instance !== null;
       chat.instance = msg.instance;
       chat.lastEventId = 0;
+      chat.waiting = [];
+      progress.clear();
       save();
+      if (lost) addMessage({ role: "error", text: "The service restarted before answering. Ask again." });
+      else renderMessages();
     }
+  }
+
+  // Events that arrive before /ask's response tells us their message id.
+  const early = new Map(); // message id -> events
+
+  function onEvent({ event, instance }) {
+    if (instance !== chat.instance || event.id <= chat.lastEventId) return;
+    chat.lastEventId = event.id;
+    const id = event.message_id;
+    if (!chat.waiting.includes(id)) {
+      if ([...progress.keys()].some((k) => k.startsWith("local-"))) {
+        early.set(id, [...(early.get(id) ?? []), event]);
+      }
+      return save(); // Otherwise: cleared, or asked from another tab.
+    }
+    applyEvent(event);
+  }
+
+  function applyEvent(event) {
+    const id = event.message_id;
+    const p = progress.get(id) ?? { status: "", partial: "" };
+    if (event.type === "status") p.status = event.text;
+    else if (event.type === "partial") p.partial = event.text;
+    if (event.type === "status" || event.type === "partial") {
+      progress.set(id, p);
+      renderMessages();
+      return;
+    }
+    chat.waiting = chat.waiting.filter((w) => w !== id);
+    progress.delete(id);
+    if (event.type === "reply") addMessage({ role: "claude", text: event.text });
+    else if (event.type === "error") addMessage({ role: "error", text: `Claude couldn't answer: ${event.text}` });
   }
 
   function onPortMessage(msg) {
     if (msg.type === "status") setStatus(msg);
-    else if (msg.type === "reply") {
-      const { event } = msg;
-      if (msg.instance !== chat.instance || event.id <= chat.lastEventId) return;
-      chat.lastEventId = event.id;
-      pending = Math.max(0, pending - 1);
-      addMessage({ role: "claude", text: event.text });
-    } else if (msg.type === "ask-result") {
+    else if (msg.type === "event") onEvent(msg);
+    else if (msg.type === "ask-result") {
       askCallbacks.get(msg.id)?.(msg);
       askCallbacks.delete(msg.id);
     }
@@ -403,7 +546,7 @@
   let pingTimer = null;
   function connect() {
     disconnect();
-    if (!chrome.runtime?.id) return; // Extension was reloaded; this page's script is orphaned.
+    if (!alive()) return shutdown();
     port = chrome.runtime.connect({ name: "chat" });
     port.onMessage.addListener(onPortMessage);
     port.onDisconnect.addListener(() => {
@@ -427,27 +570,39 @@
   async function sendQuestion() {
     const question = ui.input.value.trim();
     if (!question || !pr) return;
+    if (!alive()) return shutdown();
     if (!port) connect();
     if (!port) {
       addMessage({ role: "error", text: "The extension was updated or reloaded. Refresh this page." });
       return;
     }
     const context = pendingContext;
+    const history = historyForAsk();
     ui.input.value = "";
     autosize();
     setContext(null);
+    const seq = ++askSeq;
+    const localId = `local-${seq}`;
+    progress.set(localId, { status: "", partial: "" });
     addMessage({ role: "user", text: question, context });
-    pending++;
-    renderMessages();
-    const id = ++askSeq;
+    if (!port) return; // Shut down while saving.
     const result = await new Promise((resolve) => {
-      askCallbacks.set(id, resolve);
-      port.postMessage({ type: "ask", id, payload: { repo: pr.repo, pr: pr.pr, question, ...(context ?? {}) } });
+      askCallbacks.set(seq, resolve);
+      port.postMessage({ type: "ask", id: seq, payload: { repo: pr.repo, pr: pr.pr, question, ...(context ?? {}), history } });
     });
+    const p = progress.get(localId);
+    progress.delete(localId);
+    if (!p) return; // Cleared while sending.
     if (!result.ok) {
-      pending = Math.max(0, pending - 1);
       addMessage({ role: "error", text: `Not sent: ${result.error}` });
+      return;
     }
+    progress.set(result.messageId, p);
+    chat.waiting.push(result.messageId);
+    save();
+    renderMessages();
+    for (const event of early.get(result.messageId) ?? []) applyEvent(event);
+    early.delete(result.messageId);
   }
 
   // ---------- Panel behavior ----------
@@ -480,11 +635,7 @@
   ui.launcher.addEventListener("click", openPanel);
   $(".close").addEventListener("click", closePanel);
   $(".unchip").addEventListener("click", () => setContext(null));
-  $(".clear").addEventListener("click", () => {
-    chat.messages = [];
-    save();
-    renderMessages();
-  });
+  $(".clear").addEventListener("click", clearChat);
   ui.send.addEventListener("click", sendQuestion);
   ui.input.addEventListener("input", autosize);
   ui.input.addEventListener("keydown", (e) => {
@@ -505,11 +656,11 @@
       if (!pr) return;
       const cell = e.target instanceof Element ? e.target.closest("td") : null;
       if (!cell || cell === hoverCell) return;
-      const num = numberCellFor(cell);
-      if (!num || !findPath(num)) return;
+      const info = lineAt(cell);
+      if (!info || !findPath(info.code)) return;
       hoverCell = cell;
       const row = cell.closest("tr").getBoundingClientRect();
-      const code = codeCellFor(num)?.getBoundingClientRect() ?? row;
+      const code = info.code.getBoundingClientRect();
       ui.gutter.style.left = `${Math.min(code.right, window.innerWidth) - 30}px`;
       ui.gutter.style.top = `${row.top + Math.max(0, (row.height - 20) / 2)}px`;
       ui.gutter.style.display = "block";
@@ -568,7 +719,6 @@
     pr = next;
     hideFloating();
     setContext(null);
-    pending = 0;
     if (!pr) {
       ui.panel.classList.remove("open");
       ui.launcher.style.display = "none";
@@ -582,10 +732,39 @@
 
   (document.body ?? document.documentElement).append(host);
   // GitHub replaces <body> children on some navigations; keep our host attached.
-  new MutationObserver(() => host.isConnected || document.body.append(host)).observe(document.documentElement, { childList: true, subtree: false });
-  for (const ev of ["turbo:load", "pjax:end", "popstate"]) window.addEventListener(ev, onLocationChange);
-  setInterval(onLocationChange, 1000);
-  onLocationChange();
+  const reattach = new MutationObserver(() => host.isConnected || document.body.append(host));
+  reattach.observe(document.documentElement, { childList: true, subtree: false });
+  const tick = () => (alive() ? onLocationChange() : shutdown());
+  const navEvents = ["turbo:load", "pjax:end", "popstate"];
+  for (const ev of navEvents) window.addEventListener(ev, tick);
+  const locationTimer = setInterval(tick, 1000);
+  tick();
+
+  /**
+   * Stops this orphaned copy: timers, listeners, and UI. If the panel is open, it stays
+   * with a note to refresh (which loads the new version); otherwise everything is removed.
+   */
+  let shutDown = false;
+  function shutdown() {
+    if (shutDown) return;
+    shutDown = true;
+    clearInterval(locationTimer);
+    for (const ev of navEvents) window.removeEventListener(ev, tick);
+    reattach.disconnect();
+    clearInterval(pingTimer);
+    port = null;
+    pr = null; // Every handler checks this and does nothing.
+    hideFloating();
+    ui.launcher.style.display = "none";
+    if (!ui.panel.classList.contains("open")) return host.remove();
+    ui.dot.className = "dot bad";
+    ui.input.disabled = ui.send.disabled = true;
+    const refresh = document.createElement("button");
+    refresh.textContent = "Refresh page";
+    refresh.addEventListener("click", () => location.reload());
+    ui.banner.replaceChildren(document.createTextNode("The extension was updated. Refresh this page to keep asking."), document.createElement("br"), refresh);
+    ui.banner.classList.add("show");
+  }
 
   // Exposed for tests only.
   window.__askClaudeTest = { findPath, contextForCell, contextForSelection, renderMarkdown, describeContext };

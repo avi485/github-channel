@@ -1,48 +1,58 @@
 import { z } from "zod";
 
+const Sha = z.string().regex(/^[0-9a-f]{7,40}$/i);
+
 export const AskSchema = z.object({
   repo: z.string().regex(/^[\w.-]+\/[\w.-]+$/),
   pr: z.number().int().positive(),
   question: z.string().trim().min(1).max(8_000),
-  head_sha: z.string().regex(/^[0-9a-f]{7,40}$/i).optional(),
-  base_sha: z.string().regex(/^[0-9a-f]{7,40}$/i).optional(),
+  head_sha: Sha.optional(),
+  base_sha: Sha.optional(),
   path: z.string().max(1_000).optional(),
   line_start: z.number().int().positive().optional(),
   line_end: z.number().int().positive().optional(),
   side: z.enum(["LEFT", "RIGHT"]).optional(),
   hunk: z.string().max(20_000).optional(),
+  /** Earlier turns of this chat, oldest first. The extension owns this; Clear empties it. */
+  history: z
+    .array(z.object({ role: z.enum(["user", "assistant"]), text: z.string().max(12_000) }))
+    .max(40)
+    .optional(),
 });
 export type Ask = z.infer<typeof AskSchema> & { chat_id: string; message_id: string };
 
-export type ReplyEvent = { id: number; chat_id: string; text: string; in_reply_to?: string };
+/**
+ * Events for one question, keyed by message_id:
+ * - status: what Claude is doing ("git show …"), not buffered
+ * - partial: the answer so far, not buffered
+ * - reply / error: the outcome, buffered for reconnects
+ */
+export type EventType = "status" | "partial" | "reply" | "error";
+export type ChatEvent = { id: number; type: EventType; chat_id: string; message_id: string; text: string };
 
 export function chatIdFor(repo: string, pr: number): string {
   return `${repo.toLowerCase()}#${pr}`;
 }
 
-/** Fans replies out to SSE listeners and keeps a short buffer for reconnects. */
-export class ReplyHub {
+/** Fans events out to SSE listeners and keeps outcomes for reconnects. */
+export class EventHub {
   private nextId = 1;
-  private buffer: ReplyEvent[] = [];
-  private listeners = new Set<{ chatId?: string; send: (e: ReplyEvent) => void }>();
+  private buffer: ChatEvent[] = [];
+  private listeners = new Set<{ chatId?: string; send: (e: ChatEvent) => void }>();
 
   constructor(private readonly bufferSize = 200) {}
 
-  publish(chat_id: string, text: string, in_reply_to?: string): { event: ReplyEvent; delivered: number } {
-    const event: ReplyEvent = { id: this.nextId++, chat_id, text, in_reply_to };
-    this.buffer.push(event);
-    if (this.buffer.length > this.bufferSize) this.buffer.shift();
-    let delivered = 0;
-    for (const l of this.listeners) {
-      if (!l.chatId || l.chatId === chat_id) {
-        l.send(event);
-        delivered++;
-      }
+  publish(type: EventType, chat_id: string, message_id: string, text: string): ChatEvent {
+    const event: ChatEvent = { id: this.nextId++, type, chat_id, message_id, text };
+    if (type === "reply" || type === "error") {
+      this.buffer.push(event);
+      if (this.buffer.length > this.bufferSize) this.buffer.shift();
     }
-    return { event, delivered };
+    for (const l of this.listeners) if (!l.chatId || l.chatId === chat_id) l.send(event);
+    return event;
   }
 
-  subscribe(chatId: string | undefined, sinceId: number, send: (e: ReplyEvent) => void): () => void {
+  subscribe(chatId: string | undefined, sinceId: number, send: (e: ChatEvent) => void): () => void {
     for (const e of this.buffer) if (e.id > sinceId && (!chatId || e.chat_id === chatId)) send(e);
     const listener = { chatId, send };
     this.listeners.add(listener);
@@ -52,13 +62,14 @@ export class ReplyHub {
 
 export type HttpDeps = {
   token: string;
-  /** Random per process; reply ids restart at 1 when this changes. */
+  /** Random per process; event ids restart at 1 when this changes. */
   instance: string;
-  repo: string | null;
-  port: () => number;
-  hub: ReplyHub;
-  /** Pushes the question into the Claude Code session. */
-  deliver: (ask: Ask) => Promise<void>;
+  hub: EventHub;
+  repos: () => string[];
+  /** Local clone for a repo, or null. */
+  findClone: (repo: string) => Promise<string | null>;
+  /** Starts answering in the background; progress goes to the hub. */
+  start: (ask: Ask, cwd: string) => void;
 };
 
 const json = (body: unknown, status = 200) => Response.json(body, { status });
@@ -98,7 +109,13 @@ export function createFetchHandler(deps: HttpDeps) {
     const url = new URL(req.url);
 
     if (req.method === "GET" && url.pathname === "/info") {
-      return json({ name: "github-channel", instance: deps.instance, repo: deps.repo, port: deps.port(), cwd: process.cwd() });
+      const repo = url.searchParams.get("repo");
+      return json({
+        name: "github-channel",
+        instance: deps.instance,
+        repos: deps.repos(),
+        ...(repo ? { clone: await deps.findClone(repo) } : {}),
+      });
     }
 
     if (req.method === "POST" && url.pathname === "/ask") {
@@ -110,15 +127,14 @@ export function createFetchHandler(deps: HttpDeps) {
       }
       const parsed = AskSchema.safeParse(body);
       if (!parsed.success) return json({ error: "invalid request", issues: parsed.error.issues }, 400);
-      if (deps.repo && parsed.data.repo.toLowerCase() !== deps.repo) {
-        return json({ error: `this session is for ${deps.repo}` }, 409);
-      }
+      const cwd = await deps.findClone(parsed.data.repo);
+      if (!cwd) return json({ error: `no local clone of ${parsed.data.repo} found` }, 404);
       const ask: Ask = {
         ...parsed.data,
         chat_id: chatIdFor(parsed.data.repo, parsed.data.pr),
         message_id: crypto.randomUUID().slice(0, 8),
       };
-      await deps.deliver(ask);
+      deps.start(ask, cwd);
       return json({ ok: true, chat_id: ask.chat_id, message_id: ask.message_id }, 202);
     }
 
@@ -132,7 +148,7 @@ export function createFetchHandler(deps: HttpDeps) {
   };
 }
 
-function sseResponse(req: Request, hub: ReplyHub, chatId: string | undefined, sinceId: number): Response {
+function sseResponse(req: Request, hub: EventHub, chatId: string | undefined, sinceId: number): Response {
   const encoder = new TextEncoder();
   let cleanup = () => {};
   const stream = new ReadableStream<Uint8Array>({
@@ -146,7 +162,7 @@ function sseResponse(req: Request, hub: ReplyHub, chatId: string | undefined, si
       };
       write(": connected\n\n");
       const unsubscribe = hub.subscribe(chatId, sinceId, (e) => {
-        write(`id: ${e.id}\nevent: reply\ndata: ${JSON.stringify(e)}\n\n`);
+        write(`id: ${e.id}\nevent: ${e.type}\ndata: ${JSON.stringify(e)}\n\n`);
       });
       const keepAlive = setInterval(() => write(": ping\n\n"), 15_000);
       cleanup = () => {

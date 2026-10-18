@@ -1,8 +1,0 @@
-{
-  "mcpServers": {
-    "github-channel": {
-      "command": "bun",
-      "args": ["./channel-server/src/server.ts"]
-    }
-  }
-}

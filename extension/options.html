@@ -22,16 +22,17 @@
   <h1>Ask Claude for GitHub PRs</h1>
 
   <h2>Pairing token</h2>
-  <p>Run <code>bun run token</code> in <code>channel-server/</code> and paste the output here.</p>
+  <p>Run <code>pbcopy &lt; ~/.config/github-channel/token</code> and paste here.</p>
   <input id="token" type="password" autocomplete="off" spellcheck="false" placeholder="Pairing token">
   <button id="save">Save</button><span id="status"></span>
 
-  <h2>Running sessions</h2>
-  <p>Claude Code sessions started with <code>claude --dangerously-load-development-channels server:github-channel</code>.</p>
-  <button id="refresh" class="secondary">Refresh</button>
+  <h2>Service</h2>
+  <p>Start it with <code>bun start</code> in <code>github-channel/server</code>. It answers for any repo cloned under
+    <code>~/projects</code>, or mapped in <code>~/.config/github-channel/repos.json</code>.</p>
+  <button id="refresh" class="secondary">Refresh</button> <span id="service"></span>
   <table>
-    <thead><tr><th>Port</th><th>Repo</th><th>Folder</th></tr></thead>
-    <tbody id="sessions"></tbody>
+    <thead><tr><th>Repos with a local clone</th></tr></thead>
+    <tbody id="repos"></tbody>
   </table>
 
   <script src="options.js"></script>
