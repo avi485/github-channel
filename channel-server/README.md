@@ -52,7 +52,7 @@ Every request needs `Authorization: Bearer <token>`. The token is created on fir
 
 | Endpoint | Purpose |
 |---|---|
-| `GET /info` | `{ name, repo, port, cwd }`, used by the extension to discover sessions |
+| `GET /info` | `{ name, instance, repo, port, cwd }`, used by the extension to discover sessions. `instance` changes when the server restarts, which resets reply ids |
 | `POST /ask` | Sends a question into the session. Returns `202 { chat_id, message_id }`, or `409` if the PR is for a different repo |
 | `GET /events?chat_id=owner/repo%2312` | SSE stream of `reply` events. Send `Last-Event-ID` to replay missed replies |
 

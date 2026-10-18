@@ -62,8 +62,9 @@ test("rejects requests without the token, from web origins, or with a non-loopba
 });
 
 test("/info reports the session's repo", async () => {
-  const info = await (await fetch(`${BASE}/info`, { headers: auth })).json();
+  const info = (await (await fetch(`${BASE}/info`, { headers: auth })).json()) as Record<string, unknown>;
   expect(info).toMatchObject({ name: "github-channel", repo: "acme/widgets", port: PORT });
+  expect(info.instance).toBeString();
 });
 
 test("/ask validates input and checks the repo", async () => {
@@ -94,7 +95,7 @@ test("an ask becomes a channel notification, and a reply reaches the SSE stream"
     }),
   });
   expect(res.status).toBe(202);
-  const { chat_id, message_id } = await res.json();
+  const { chat_id, message_id } = (await res.json()) as { chat_id: string; message_id: string };
   expect(chat_id).toBe(chatId);
 
   for (let i = 0; i < 50 && notifications.length === 0; i++) await Bun.sleep(20);

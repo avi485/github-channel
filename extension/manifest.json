@@ -1,0 +1,23 @@
+{
+  "manifest_version": 3,
+  "name": "Ask Claude for GitHub PRs",
+  "version": "0.1.0",
+  "description": "Ask your running Claude Code session about lines in a GitHub pull request.",
+  "permissions": ["storage"],
+  "host_permissions": ["http://127.0.0.1/*"],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://github.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "options_page": "options.html",
+  "action": {
+    "default_title": "Ask Claude settings"
+  }
+}

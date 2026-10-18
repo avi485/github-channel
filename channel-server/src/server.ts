@@ -125,6 +125,7 @@ async function main() {
   let boundPort = 0;
   const fetch = createFetchHandler({
     token,
+    instance: crypto.randomUUID(),
     repo,
     port: () => boundPort,
     hub,

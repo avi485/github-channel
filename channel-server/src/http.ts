@@ -52,6 +52,8 @@ export class ReplyHub {
 
 export type HttpDeps = {
   token: string;
+  /** Random per process; reply ids restart at 1 when this changes. */
+  instance: string;
   repo: string | null;
   port: () => number;
   hub: ReplyHub;
@@ -96,7 +98,7 @@ export function createFetchHandler(deps: HttpDeps) {
     const url = new URL(req.url);
 
     if (req.method === "GET" && url.pathname === "/info") {
-      return json({ name: "github-channel", repo: deps.repo, port: deps.port(), cwd: process.cwd() });
+      return json({ name: "github-channel", instance: deps.instance, repo: deps.repo, port: deps.port(), cwd: process.cwd() });
     }
 
     if (req.method === "POST" && url.pathname === "/ask") {
