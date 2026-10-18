@@ -1,0 +1,21 @@
+{
+  "name": "github-channel-server",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "bun src/server.ts",
+    "token": "bun src/print-token.ts",
+    "test": "bun test",
+    "typecheck": "bun check"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^7"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.1",
+    "zod": "^4.6.7"
+  }
+}
