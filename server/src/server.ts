@@ -1,12 +1,13 @@
 #!/usr/bin/env bun
 /**
- * github-channel service: answers questions from the "Ask Claude" Chrome extension
- * by running `claude -p` in your local clone of the PR's repo.
+ * github-channel service: answers questions from the "Ask Claude" Chrome extension.
+ * Each PR chat gets its own long-running Claude Code session in your local clone of
+ * the repo, which remembers the conversation and resumes after restarts.
  */
-import { buildPrompt, runClaude } from "./claude.ts";
-import { loadOrCreateToken, PORT, SCAN_ROOTS, TIMEOUT_MS } from "./config.ts";
+import { loadOrCreateToken, PORT, SCAN_ROOTS } from "./config.ts";
 import { type Ask, createFetchHandler, EventHub } from "./http.ts";
 import { RepoIndex } from "./repos.ts";
+import { SessionManager } from "./sessions.ts";
 
 const log = (...args: unknown[]) => console.log(new Date().toISOString().slice(11, 19), ...args);
 
@@ -14,6 +15,7 @@ const token = await loadOrCreateToken();
 const hub = new EventHub();
 const repos = new RepoIndex(SCAN_ROOTS);
 await repos.scan();
+const sessions = new SessionManager();
 
 // Questions in one chat run in order, so answers arrive in the order they were asked.
 const chatQueues = new Map<string, Promise<void>>();
@@ -22,15 +24,10 @@ async function answer(ask: Ask, cwd: string) {
   const started = Date.now();
   log(`ask ${ask.message_id} ${ask.chat_id} in ${cwd}`);
   try {
-    const text = await runClaude(
-      cwd,
-      buildPrompt(ask),
-      {
-        onPartial: (t) => hub.publish("partial", ask.chat_id, ask.message_id, t),
-        onStatus: (t) => hub.publish("status", ask.chat_id, ask.message_id, t),
-      },
-      { timeoutMs: TIMEOUT_MS },
-    );
+    const text = await sessions.ask(ask, cwd, {
+      onPartial: (t) => hub.publish("partial", ask.chat_id, ask.message_id, t),
+      onStatus: (t) => hub.publish("status", ask.chat_id, ask.message_id, t),
+    });
     hub.publish("reply", ask.chat_id, ask.message_id, text);
     log(`done ${ask.message_id} in ${Math.round((Date.now() - started) / 1000)}s`);
   } catch (err) {
@@ -58,8 +55,21 @@ const server = Bun.serve({
     repos: () => repos.list(),
     findClone: (repo) => repos.find(repo),
     start,
+    sessionInfo: (chatId) => sessions.info(chatId),
+    resetSession: async (chatId) => {
+      log(`new session for ${chatId}`);
+      await sessions.reset(chatId);
+    },
   }),
 });
+
+// Let Claude Code save each session cleanly on Ctrl+C.
+for (const signal of ["SIGINT", "SIGTERM"] as const) {
+  process.on(signal, () => {
+    sessions.closeAll();
+    setTimeout(() => process.exit(0), 500);
+  });
+}
 
 log(`listening on http://127.0.0.1:${server.port}`);
 log(`found ${repos.list().length} clones under ${SCAN_ROOTS.join(", ")}: ${repos.list().join(", ") || "(none)"}`);

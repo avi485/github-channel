@@ -9,6 +9,8 @@ export const PORT = Number(process.env.GITHUB_CHANNEL_PORT ?? 8790);
 export const CLAUDE_BIN = process.env.GITHUB_CHANNEL_CLAUDE_BIN ?? "claude";
 export const CLAUDE_MODEL = process.env.GITHUB_CHANNEL_MODEL;
 export const TIMEOUT_MS = Number(process.env.GITHUB_CHANNEL_TIMEOUT_MS ?? 10 * 60_000);
+/** A PR's Claude process ends after this long without questions; its session resumes on the next one. */
+export const IDLE_MS = Number(process.env.GITHUB_CHANNEL_IDLE_MS ?? 30 * 60_000);
 /** Folders scanned (two levels deep) for clones, colon-separated. */
 export const SCAN_ROOTS = (process.env.GITHUB_CHANNEL_ROOTS ?? join(homedir(), "projects")).split(":").filter(Boolean);
 

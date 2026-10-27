@@ -7,12 +7,15 @@ const base = (port) => `http://127.0.0.1:${port}`;
 const authHeaders = (token) => ({ authorization: `Bearer ${token}` });
 
 /**
- * Checks the service and whether it has a clone of `repo`. Returns
- * { state: "ok" | "no-service" | "bad-token" | "no-clone", ...info }.
+ * Checks the service, whether it has a clone of `repo`, and the PR's saved session.
+ * Returns { state: "ok" | "no-service" | "bad-token" | "no-clone", ...info }.
  */
-export async function getStatus(token, repo, port = DEFAULT_PORT) {
+export async function getStatus(token, repo, pr, port = DEFAULT_PORT) {
   try {
-    const query = repo ? `?repo=${encodeURIComponent(repo)}` : "";
+    const params = new URLSearchParams();
+    if (repo) params.set("repo", repo);
+    if (pr) params.set("pr", String(pr));
+    const query = params.size ? `?${params}` : "";
     const res = await fetch(`${base(port)}/info${query}`, {
       headers: authHeaders(token),
       signal: AbortSignal.timeout(2000),
@@ -32,6 +35,18 @@ export async function ask(port, token, payload) {
     method: "POST",
     headers: { ...authHeaders(token), "content-type": "application/json" },
     body: JSON.stringify(payload),
+  });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(body.error ?? `HTTP ${res.status}`);
+  return body;
+}
+
+/** Ends the PR's Claude session; its next question starts a new one. */
+export async function resetSession(port, token, repo, pr) {
+  const res = await fetch(`${base(port)}/session/reset`, {
+    method: "POST",
+    headers: { ...authHeaders(token), "content-type": "application/json" },
+    body: JSON.stringify({ repo, pr }),
   });
   const body = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(body.error ?? `HTTP ${res.status}`);

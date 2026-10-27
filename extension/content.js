@@ -243,7 +243,10 @@
         box-shadow: 0 12px 32px rgba(0,0,0,.25); overflow: hidden; }
       .panel.open { display: flex; }
       header { display: flex; align-items: center; gap: 8px; padding: 10px 12px; border-bottom: 1px solid var(--border); background: var(--bg2); }
-      header .title { font-weight: 600; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      header .heading { flex: 1; min-width: 0; display: flex; flex-direction: column; line-height: 1.25; }
+      header .title { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      header .session { font-size: 11px; color: var(--muted); }
+      .icon:disabled { opacity: .5; cursor: default; }
       .dot { width: 8px; height: 8px; border-radius: 50%; background: #9198a1; flex: none; }
       .dot.ok { background: #1a7f37; } .dot.bad { background: #cf222e; }
       .icon { border: 0; background: transparent; color: var(--muted); padding: 2px 6px; border-radius: 6px; }
@@ -288,8 +291,9 @@
       <button class="launcher">✦ Ask Claude</button>
       <section class="panel" role="dialog" aria-label="Ask Claude">
         <header>
-          <span class="dot"></span><span class="title"></span>
-          <button class="icon clear" title="Clear this chat and start a new conversation">Clear</button>
+          <span class="dot"></span>
+          <span class="heading"><span class="title"></span><span class="session"></span></span>
+          <button class="icon new-session" title="End this PR's Claude session and start a new one">New session</button>
           <button class="icon close" title="Close" aria-label="Close">✕</button>
         </header>
         <div class="banner"></div>
@@ -312,11 +316,9 @@
   };
 
   // ---------- Chat state ----------
-  // The extension owns the chat history: each question is sent with the recent
-  // turns, so the service stays stateless. Clear starts the conversation over.
-
-  const HISTORY_TURNS = 20;
-  const HISTORY_TURN_CHARS = 6_000;
+  // Each PR has a Claude Code session on the service that remembers the conversation
+  // and resumes after restarts. The panel only keeps the messages for display.
+  // "New session" ends that session and clears the panel.
 
   let pr = null; // { repo, pr, chatId }
   // Persisted per PR. `waiting` holds message ids of questions still being answered.
@@ -374,23 +376,48 @@
     renderMessages();
   }
 
-  function clearChat() {
+  let resetCallback = null;
+
+  async function newSession() {
+    if (!pr) return;
+    if (chat.messages.length && !confirm("Start a new session for this PR? Claude will forget this conversation.")) return;
+    if (!port) connect();
+    if (!port) return;
+    const button = $(".new-session");
+    button.disabled = true;
+    const result = await new Promise((resolve) => {
+      resetCallback = resolve;
+      port.postMessage({ type: "reset" });
+    });
+    button.disabled = false;
+    if (!result.ok) {
+      addMessage({ role: "error", text: `Couldn't start a new session: ${result.error}` });
+      return;
+    }
     chat = { ...emptyChat(), instance: chat.instance, lastEventId: chat.lastEventId };
     progress.clear();
     early.clear();
     save();
+    setSessionLabel(null);
     renderMessages();
+    ui.input.focus();
   }
 
-  /** Earlier turns to send with a question, oldest first. */
-  function historyForAsk() {
-    return chat.messages
-      .filter((m) => m.role === "user" || m.role === "claude")
-      .slice(-HISTORY_TURNS)
-      .map((m) => ({
-        role: m.role === "user" ? "user" : "assistant",
-        text: (m.context ? `(about ${describeContext(m.context)})\n` : "") + m.text.slice(0, HISTORY_TURN_CHARS),
-      }));
+  /** Header note: whether the next question continues a saved session or starts one. */
+  function setSessionLabel(session) {
+    const label = $(".session");
+    if (!session) {
+      label.textContent = "new session";
+      label.title = "The next question starts a new Claude session for this PR.";
+      return;
+    }
+    const started = new Date(session.created);
+    const sameDay = started.toDateString() === new Date().toDateString();
+    const when = sameDay
+      ? started.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+      : started.toLocaleDateString([], { month: "short", day: "numeric" });
+    label.textContent = `session since ${when}`;
+    label.title = `Claude remembers this PR's conversation (session ${session.session_id}).`;
   }
 
   function renderClaude(el, text) {
@@ -530,13 +557,22 @@
     }
     chat.waiting = chat.waiting.filter((w) => w !== id);
     progress.delete(id);
-    if (event.type === "reply") addMessage({ role: "claude", text: event.text });
+    if (event.type === "reply") {
+      addMessage({ role: "claude", text: event.text });
+      port?.postMessage({ type: "session-info" });
+    }
     else if (event.type === "error") addMessage({ role: "error", text: `Claude couldn't answer: ${event.text}` });
   }
 
   function onPortMessage(msg) {
-    if (msg.type === "status") setStatus(msg);
-    else if (msg.type === "event") onEvent(msg);
+    if (msg.type === "status") {
+      setStatus(msg);
+      if (msg.state === "ok") setSessionLabel(msg.session);
+    } else if (msg.type === "session-info") setSessionLabel(msg.session);
+    else if (msg.type === "reset-result") {
+      resetCallback?.(msg);
+      resetCallback = null;
+    } else if (msg.type === "event") onEvent(msg);
     else if (msg.type === "ask-result") {
       askCallbacks.get(msg.id)?.(msg);
       askCallbacks.delete(msg.id);
@@ -554,7 +590,7 @@
       // The service worker was stopped; reconnect while the panel is open.
       if (ui.panel.classList.contains("open") && pr) setTimeout(connect, 500);
     });
-    port.postMessage({ type: "hello", repo: pr.repo, chatId: pr.chatId, instance: chat.instance, lastEventId: chat.lastEventId });
+    port.postMessage({ type: "hello", repo: pr.repo, pr: pr.pr, chatId: pr.chatId, instance: chat.instance, lastEventId: chat.lastEventId });
     pingTimer = setInterval(() => port?.postMessage({ type: "ping" }), 20_000);
   }
 
@@ -577,7 +613,6 @@
       return;
     }
     const context = pendingContext;
-    const history = historyForAsk();
     ui.input.value = "";
     autosize();
     setContext(null);
@@ -588,7 +623,7 @@
     if (!port) return; // Shut down while saving.
     const result = await new Promise((resolve) => {
       askCallbacks.set(seq, resolve);
-      port.postMessage({ type: "ask", id: seq, payload: { repo: pr.repo, pr: pr.pr, question, ...(context ?? {}), history } });
+      port.postMessage({ type: "ask", id: seq, payload: { repo: pr.repo, pr: pr.pr, question, ...(context ?? {}) } });
     });
     const p = progress.get(localId);
     progress.delete(localId);
@@ -635,7 +670,7 @@
   ui.launcher.addEventListener("click", openPanel);
   $(".close").addEventListener("click", closePanel);
   $(".unchip").addEventListener("click", () => setContext(null));
-  $(".clear").addEventListener("click", clearChat);
+  $(".new-session").addEventListener("click", newSession);
   ui.send.addEventListener("click", sendQuestion);
   ui.input.addEventListener("input", autosize);
   ui.input.addEventListener("keydown", (e) => {
@@ -659,14 +694,45 @@
       const info = lineAt(cell);
       if (!info || !findPath(info.code)) return;
       hoverCell = cell;
-      const row = cell.closest("tr").getBoundingClientRect();
-      const code = info.code.getBoundingClientRect();
-      ui.gutter.style.left = `${Math.min(code.right, window.innerWidth) - 30}px`;
-      ui.gutter.style.top = `${row.top + Math.max(0, (row.height - 20) / 2)}px`;
-      ui.gutter.style.display = "block";
+      placeGutter(cell, info.code);
+      // GitHub draws its own hover buttons a moment after the mouse arrives; move next to them once they exist.
+      for (const ms of [50, 200]) setTimeout(() => hoverCell === cell && placeGutter(cell, info.code), ms);
     },
     { passive: true },
   );
+
+  // GitHub's hover buttons on a line (comment, etc.) in the new view: a Primer ButtonGroup.
+  const LINE_ACTIONS = '[class*="prc-ButtonGroup-ButtonGroup"], [class*="prc-ButtonGroup-Item"]';
+
+  /** GitHub's visible button group on this row, if any (it may be rendered just outside the row). */
+  function lineActionsFor(row) {
+    const rowRect = row.getBoundingClientRect();
+    const scope = row.closest("table")?.parentElement ?? row;
+    for (const el of [...row.querySelectorAll(LINE_ACTIONS), ...scope.querySelectorAll(LINE_ACTIONS)]) {
+      const group = el.closest('[class*="prc-ButtonGroup-ButtonGroup"]') ?? el;
+      const r = group.getBoundingClientRect();
+      const visible = r.width > 0 && r.height > 0 && getComputedStyle(group).visibility !== "hidden";
+      if (visible && r.bottom > rowRect.top && r.top < rowRect.bottom) return r;
+    }
+    return null;
+  }
+
+  /** Puts ✦ just left of GitHub's line buttons, or at the right edge of the code cell. */
+  function placeGutter(cell, codeCell) {
+    const rowEl = cell.closest("tr");
+    if (!rowEl) return;
+    const row = rowEl.getBoundingClientRect();
+    const actions = lineActionsFor(rowEl);
+    if (actions) {
+      ui.gutter.style.left = `${actions.left - 22 - 4}px`;
+      ui.gutter.style.top = `${actions.top + (actions.height - 20) / 2}px`;
+    } else {
+      const code = codeCell.getBoundingClientRect();
+      ui.gutter.style.left = `${Math.min(code.right, window.innerWidth) - 30}px`;
+      ui.gutter.style.top = `${row.top + Math.max(0, (row.height - 20) / 2)}px`;
+    }
+    ui.gutter.style.display = "block";
+  }
 
   const hideFloating = () => {
     ui.gutter.style.display = "none";

@@ -13,12 +13,9 @@ export const AskSchema = z.object({
   line_end: z.number().int().positive().optional(),
   side: z.enum(["LEFT", "RIGHT"]).optional(),
   hunk: z.string().max(20_000).optional(),
-  /** Earlier turns of this chat, oldest first. The extension owns this; Clear empties it. */
-  history: z
-    .array(z.object({ role: z.enum(["user", "assistant"]), text: z.string().max(12_000) }))
-    .max(40)
-    .optional(),
 });
+
+const ChatRef = z.object({ repo: AskSchema.shape.repo, pr: AskSchema.shape.pr });
 export type Ask = z.infer<typeof AskSchema> & { chat_id: string; message_id: string };
 
 /**
@@ -70,6 +67,10 @@ export type HttpDeps = {
   findClone: (repo: string) => Promise<string | null>;
   /** Starts answering in the background; progress goes to the hub. */
   start: (ask: Ask, cwd: string) => void;
+  /** The PR chat's saved session, if any. */
+  sessionInfo: (chatId: string) => Promise<unknown>;
+  /** Ends the PR chat's session; the next question starts a new one. */
+  resetSession: (chatId: string) => Promise<void>;
 };
 
 const json = (body: unknown, status = 200) => Response.json(body, { status });
@@ -110,12 +111,21 @@ export function createFetchHandler(deps: HttpDeps) {
 
     if (req.method === "GET" && url.pathname === "/info") {
       const repo = url.searchParams.get("repo");
+      const pr = Number(url.searchParams.get("pr"));
       return json({
         name: "github-channel",
         instance: deps.instance,
         repos: deps.repos(),
         ...(repo ? { clone: await deps.findClone(repo) } : {}),
+        ...(repo && pr ? { session: await deps.sessionInfo(chatIdFor(repo, pr)) } : {}),
       });
+    }
+
+    if (req.method === "POST" && url.pathname === "/session/reset") {
+      const parsed = ChatRef.safeParse(await req.json().catch(() => null));
+      if (!parsed.success) return json({ error: "invalid request", issues: parsed.error.issues }, 400);
+      await deps.resetSession(chatIdFor(parsed.data.repo, parsed.data.pr));
+      return json({ ok: true });
     }
 
     if (req.method === "POST" && url.pathname === "/ask") {

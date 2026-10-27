@@ -1,11 +1,12 @@
 # Ask Claude for GitHub PRs (Chrome extension)
 
-Adds "Ask Claude" to GitHub pull request pages. Questions go to the [local service](../server), which runs
-`claude -p` in your clone of the repo, and answers stream back into a chat panel. There's one chat per PR, so
-the conversation follows you across files.
+Adds "Ask Claude" to GitHub pull request pages. Questions go to the [local service](../server), which keeps a
+Claude Code session per PR in your clone of the repo, and answers stream back into a chat panel. There's one
+chat per PR, so the conversation follows you across files.
 
-Each question is sent with the chat's recent turns (up to 20), so follow-ups have context. **Clear** wipes the
-chat and starts a new conversation. History is kept in the extension's local storage.
+Claude remembers each PR's conversation, including when you come back days later: the panel header shows
+"session since …" when a saved session will be resumed. **New session** ends it and starts over. The panel's
+messages are kept in the extension's local storage for display.
 
 ## Install
 
@@ -39,5 +40,6 @@ it's written.
 - Line detection supports GitHub's newer "Files changed" view (`/pull/N/changes`) and the classic one
   (`/pull/N/files`). The new view was checked in split layout; its unified layout is untested. If the ✦ button stops
   appearing, select the code instead: that only needs the file path.
-- Each question starts a fresh `claude` process, so expect a few seconds before the first output.
+- The first question after a while starts (or resumes) the PR's `claude` process, so expect a few seconds
+  before the first output.
 - Questions in one PR's chat are answered one at a time.

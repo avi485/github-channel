@@ -1,23 +1,22 @@
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { realpath } from "node:fs/promises";
+import { join } from "node:path";
 import { parseGitHubRepo } from "../src/config.ts";
-import { auth, readUntil, startServer, type TestServer } from "./helpers.ts";
+import { askAndWait, auth, claudeCalls, createFixture, type Fixture, post, startServer, type TestServer } from "./helpers.ts";
 
+let f: Fixture;
 let server: TestServer;
-let failing: TestServer;
 
 beforeAll(async () => {
-  server = await startServer(18790);
-  failing = await startServer(18791, { FAKE_CLAUDE_MODE: "fail" });
+  f = await createFixture();
+  server = await startServer(f, 18790);
 });
 
-afterAll(() => {
-  server.stop();
-  failing.stop();
+afterAll(async () => {
+  await server.stop();
 });
 
-const post = (base: string, body: unknown) =>
-  fetch(`${base}/ask`, { method: "POST", headers: { ...auth, "content-type": "application/json" }, body: JSON.stringify(body) });
+const sessionIdOf = (answer: string) => answer.split(" in ")[1];
 
 test("rejects requests without the token, from web origins, or with a non-loopback Host", async () => {
   expect((await fetch(`${server.base}/info`)).status).toBe(401);
@@ -29,19 +28,17 @@ test("rejects requests without the token, from web origins, or with a non-loopba
 test("/info lists configured and scanned clones", async () => {
   const info = (await (await fetch(`${server.base}/info?repo=acme/widgets`, { headers: auth })).json()) as Record<string, unknown>;
   expect(info.repos).toEqual(["acme/scanned", "acme/widgets"]);
-  expect(info.clone).toBe(server.clone);
+  expect(info.clone).toBe(f.clone);
   expect(info.instance).toBeString();
 });
 
 test("/ask validates input and needs a clone", async () => {
-  expect((await post(server.base, { repo: "acme/widgets", pr: 1 })).status).toBe(400);
-  expect((await post(server.base, { repo: "other/repo", pr: 1, question: "hi" })).status).toBe(404);
+  expect((await post(server.base, "/ask", { repo: "acme/widgets", pr: 1 })).status).toBe(400);
+  expect((await post(server.base, "/ask", { repo: "other/repo", pr: 1, question: "hi" })).status).toBe(404);
 });
 
-test("runs claude in the clone with history, streams progress, then replies", async () => {
-  const chatId = "acme/widgets#42";
-  const sse = await fetch(`${server.base}/events?chat_id=${encodeURIComponent(chatId)}`, { headers: auth });
-  const res = await post(server.base, {
+test("a PR keeps one session across questions, and streams progress", async () => {
+  const first = await askAndWait(server.base, {
     repo: "acme/widgets",
     pr: 42,
     question: "Why is this retry loop unbounded?",
@@ -49,50 +46,94 @@ test("runs claude in the clone with history, streams progress, then replies", as
     line_start: 10,
     side: "RIGHT",
     hunk: "+while (true) { retry() }",
-    history: [
-      { role: "user", text: "What does this PR do?" },
-      { role: "assistant", text: "It adds retries." },
-    ],
   });
-  expect(res.status).toBe(202);
-  const { message_id } = (await res.json()) as { message_id: string };
+  expect(first.type).toBe("reply");
+  expect(first.text).toStartWith("Answer 1 in ");
+  const types = first.events.map((e) => e.type);
+  expect(types).toContain("status");
+  expect(types).toContain("partial");
+  expect(first.events.find((e) => e.type === "status")?.text).toBe("Starting a new session…");
 
-  const text = await readUntil(sse, (t) => t.includes("event: reply"));
-  expect(text).toContain("event: status");
-  expect(text).toContain("git show abc:src/a.ts");
-  expect(text).toContain("event: partial");
-  expect(text).toContain('"text":"The answer is 42."');
-  expect(text).toContain(`"message_id":"${message_id}"`);
+  const second = await askAndWait(server.base, { repo: "acme/widgets", pr: 42, question: "And the follow-up?" });
+  expect(second.text).toBe(`Answer 2 in ${sessionIdOf(first.text)}`);
 
-  const call = JSON.parse(await Bun.file(server.logFile).text());
-  expect(await realpath(call.cwd)).toBe(await realpath(server.clone));
-  expect(call.args).toContain("-p");
-  expect(call.args.join(" ")).toContain("--permission-mode dontAsk");
-  expect(call.args).toContain("--no-session-persistence");
-  expect(call.prompt).toContain("Pull request: acme/widgets#42");
-  expect(call.prompt).toContain("<conversation_so_far>\n[user]\nWhat does this PR do?\n\n[assistant]\nIt adds retries.");
-  expect(call.prompt).toContain("Question:\nWhy is this retry loop unbounded?");
-  expect(call.prompt).toContain("Context: src/retry.ts line 10 (new side)");
-  expect(call.prompt).toContain("<untrusted_diff>\n+while (true) { retry() }\n</untrusted_diff>");
+  const calls = (await claudeCalls(f)).filter((c) => c.prompt.includes("acme/widgets#42"));
+  expect(calls).toHaveLength(2);
+  expect(await realpath(calls[0]!.cwd)).toBe(await realpath(f.clone));
+  expect(calls[0]!.args.join(" ")).toContain("--input-format stream-json");
+  expect(calls[0]!.args.join(" ")).toContain("--permission-mode dontAsk");
+  expect(calls[0]!.args).not.toContain("--no-session-persistence");
+  expect(calls[0]!.prompt).toContain("Question:\nWhy is this retry loop unbounded?");
+  expect(calls[0]!.prompt).toContain("Context: src/retry.ts line 10 (new side)");
+  expect(calls[0]!.prompt).toContain("<untrusted_diff>\n+while (true) { retry() }\n</untrusted_diff>");
+  expect(calls[1]!.prompt).not.toContain("<untrusted_diff>");
+
+  const info = (await (await fetch(`${server.base}/info?repo=acme/widgets&pr=42`, { headers: auth })).json()) as {
+    session: { session_id: string; live: boolean };
+  };
+  expect(info.session).toMatchObject({ session_id: sessionIdOf(first.text), live: true });
 });
 
-test("a question without history has no conversation block", async () => {
-  const sse = await fetch(`${server.base}/events?chat_id=${encodeURIComponent("acme/widgets#43")}`, { headers: auth });
-  await post(server.base, { repo: "acme/widgets", pr: 43, question: "First question" });
-  await readUntil(sse, (t) => t.includes("event: reply"));
-  const call = JSON.parse(await Bun.file(server.logFile).text());
-  expect(call.prompt).not.toContain("<conversation_so_far>");
+test("other PRs get their own sessions", async () => {
+  const a = await askAndWait(server.base, { repo: "acme/widgets", pr: 50, question: "hi" });
+  const b = await askAndWait(server.base, { repo: "acme/widgets", pr: 51, question: "hi" });
+  expect(a.text).toStartWith("Answer 1 in ");
+  expect(b.text).toStartWith("Answer 1 in ");
+  expect(sessionIdOf(a.text)).not.toBe(sessionIdOf(b.text));
+});
+
+test("New session forgets the PR's session", async () => {
+  const before = await askAndWait(server.base, { repo: "acme/widgets", pr: 60, question: "hi" });
+  expect((await post(server.base, "/session/reset", { repo: "acme/widgets", pr: 60 })).status).toBe(200);
+  const info = (await (await fetch(`${server.base}/info?repo=acme/widgets&pr=60`, { headers: auth })).json()) as {
+    session: unknown;
+  };
+  expect(info.session).toBeNull();
+  const after = await askAndWait(server.base, { repo: "acme/widgets", pr: 60, question: "hi again" });
+  expect(after.text).toStartWith("Answer 1 in ");
+  expect(sessionIdOf(after.text)).not.toBe(sessionIdOf(before.text));
+});
+
+test("after a restart, a PR resumes its saved session", async () => {
+  const before = await askAndWait(server.base, { repo: "acme/widgets", pr: 70, question: "hi" });
+  await server.stop();
+  server = await startServer(f, 18790);
+  const after = await askAndWait(server.base, { repo: "acme/widgets", pr: 70, question: "remember me?" });
+  expect(after.text).toBe(`Answer 2 in ${sessionIdOf(before.text)}`);
+  expect(after.events.find((e) => e.type === "status")?.text).toBe("Resuming this PR's session…");
+  const last = (await claudeCalls(f)).at(-1)!;
+  expect(last.resumeId).toBe(sessionIdOf(before.text));
+});
+
+test("a session that can't be resumed is replaced by a new one", async () => {
+  const sessionsFile = join(f.configDir, "sessions.json");
+  const sessions = await Bun.file(sessionsFile).json();
+  sessions["acme/widgets#80"] = { session_id: "missing-1", cwd: f.clone, created: "2026-01-01T00:00:00Z", updated: "2026-01-01T00:00:00Z" };
+  await Bun.write(sessionsFile, JSON.stringify(sessions));
+  await server.stop();
+  server = await startServer(f, 18790);
+  const answer = await askAndWait(server.base, { repo: "acme/widgets", pr: 80, question: "hi" });
+  expect(answer.type).toBe("reply");
+  expect(answer.text).toStartWith("Answer 1 in ");
+  expect(answer.events.map((e) => e.text)).toContain("Couldn't resume the previous session; starting a new one…");
 });
 
 test("a failed run becomes an error event, replayed with Last-Event-ID", async () => {
-  const chatId = "acme/widgets#7";
-  await post(failing.base, { repo: "acme/widgets", pr: 7, question: "hi" });
-  await Bun.sleep(1000);
-  const sse = await fetch(`${failing.base}/events?chat_id=${encodeURIComponent(chatId)}`, {
-    headers: { ...auth, "last-event-id": "0" },
-  });
-  const text = await readUntil(sse, (t) => t.includes("event: error"));
-  expect(text).toContain("something went wrong");
+  const failing = await startServer(f, 18791, { FAKE_CLAUDE_MODE: "fail" });
+  try {
+    await post(failing.base, "/ask", { repo: "acme/widgets", pr: 7, question: "hi" });
+    await Bun.sleep(1000);
+    const sse = await fetch(`${failing.base}/events?chat_id=${encodeURIComponent("acme/widgets#7")}`, {
+      headers: { ...auth, "last-event-id": "0" },
+    });
+    const reader = sse.body!.pipeThrough(new TextDecoderStream()).getReader();
+    let text = "";
+    while (!text.includes("event: error")) text += (await reader.read()).value ?? "";
+    await reader.cancel();
+    expect(text).toContain("something went wrong");
+  } finally {
+    await failing.stop();
+  }
 });
 
 test("parses GitHub remotes", () => {

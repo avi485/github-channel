@@ -1,6 +1,6 @@
 // Service worker: owns all traffic to 127.0.0.1 (content scripts can't reach it
 // from github.com), and relays it to chat panels over runtime ports.
-import { ask, getStatus, streamEvents } from "./bridge.js";
+import { ask, getStatus, resetSession, streamEvents } from "./bridge.js";
 
 const getToken = async () => (await chrome.storage.local.get("token")).token ?? "";
 
@@ -41,12 +41,24 @@ class ChatConnection {
   async onMessage(msg) {
     if (msg.type === "hello") {
       this.repo = msg.repo;
+      this.pr = msg.pr;
       this.chatId = msg.chatId;
       this.instance = msg.instance;
       this.lastEventId = msg.lastEventId ?? 0;
       this.run();
     } else if (msg.type === "retry") {
       this.wake?.();
+    } else if (msg.type === "reset") {
+      try {
+        if (this.status?.state !== "ok") throw new Error("The service isn't reachable. Check the banner above.");
+        await resetSession(this.status.port, await getToken(), this.repo, this.pr);
+        this.post({ type: "reset-result", ok: true });
+      } catch (err) {
+        this.post({ type: "reset-result", ok: false, error: String(err.message ?? err) });
+      }
+    } else if (msg.type === "session-info") {
+      const status = await getStatus(await getToken(), this.repo, this.pr);
+      this.post({ type: "session-info", session: status.session ?? null });
     } else if (msg.type === "ask") {
       try {
         if (this.status?.state !== "ok") throw new Error("The service isn't reachable. Check the banner above.");
@@ -71,8 +83,8 @@ class ChatConnection {
     const { signal } = this.abort;
     while (!signal.aborted) {
       const token = await getToken();
-      this.status = token ? await getStatus(token, this.repo) : { state: "no-token" };
-      this.post({ type: "status", state: this.status.state, instance: this.status.instance });
+      this.status = token ? await getStatus(token, this.repo, this.pr) : { state: "no-token" };
+      this.post({ type: "status", state: this.status.state, instance: this.status.instance, session: this.status.session ?? null });
       if (this.status.state === "no-service" || this.status.state === "no-token" || this.status.state === "bad-token") {
         await this.sleep(5000);
         continue;
